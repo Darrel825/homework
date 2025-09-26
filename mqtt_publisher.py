@@ -1,61 +1,108 @@
 # mqtt_client/mqtt_publisher.py
+import sys
+import os
+
+# 获取当前文件所在目录（mqtt_client）
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 获取项目根目录（vending_machine_system）
+project_root = os.path.dirname(current_dir)
+# 将项目根目录加入模块搜索路径
+sys.path.append(project_root)
+
+# 现在可以导入 backend.config
+from backend.config import Config
+
 import paho.mqtt.client as mqtt
 import json
-import time
 import random
-from datetime import datetime
+import time
+import pymysql
 
-# MQTT 配置
-MQTT_BROKER = "localhost"  # 如果 Mosquitto 在本地
-MQTT_PORT = 1883
-TOPIC = "vending/machine/V001/purchase"
+def get_db_connection():
+    return pymysql.connect(
+        host=Config.DB_HOST,
+        user=Config.DB_USER,
+        password=Config.DB_PASSWORD,
+        database=Config.DB_NAME,
+        port=Config.DB_PORT,
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor
+    )
 
-# 模拟商品
-PRODUCTS = [
-    {"product_id": 1, "name": "矿泉水", "price": 2.0},
-    {"product_id": 2, "name": "可乐", "price": 3.5},
-    {"product_id": 3, "name": "薯片", "price": 5.0}
-]
+def load_data_from_db():
+    """从数据库加载用户、机器、商品信息"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 获取用户 ID 列表
+            cursor.execute("SELECT user_id FROM users")
+            user_ids = [row['user_id'] for row in cursor.fetchall()]
 
-def on_connect(client, userdata, flags, rc):
-    print(" MQTT Publisher 连接成功")
+            # 获取机器 ID 列表
+            cursor.execute("SELECT machine_id FROM machines")
+            machine_ids = [row['machine_id'] for row in cursor.fetchall()]
 
-client = mqtt.Client()
-client.on_connect = on_connect
+            # 获取商品 ID 和价格
+            cursor.execute("SELECT product_id, price FROM products")
+            products = {row['product_id']: float(row['price']) for row in cursor.fetchall()}
 
-try:
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_start()
+        return user_ids, machine_ids, products
+    finally:
+        conn.close()
 
-    print("售货机模拟器启动，每 5 秒发送一次购买记录...")
-    for i in range(5):  # 发送 5 次测试消息
-        product = random.choice(PRODUCTS)
-        qty = random.randint(1, 2)
-        total = product['price'] * qty
-        user_id = f"U{random.randint(1000, 9999)}"
+def publish_purchase(client):
+    """执行一次购买消息发送"""
+    # 发送前重新加载数据
+    user_ids, machine_ids, products = load_data_from_db()
 
-        msg = {
-            "machine_id": "V001",
-            "timestamp": datetime.now().isoformat(),
-            "event": "purchase",
-            "user_id": user_id,
-            "items": [{
-                "product_id": product['product_id'],
-                "name": product['name'],
-                "price": product['price'],
-                "quantity": qty
-            }],
-            "total_amount": total,
-            "payment_method": random.choice(['wechat', 'alipay'])
-        }
+    if not all([user_ids, machine_ids, products]):
+        print("数据加载失败，跳过本次发送")
+        return False
 
-        client.publish(TOPIC, json.dumps(msg))
-        print(f"已发送: {product['name']} x{qty} = {total}元")
-        time.sleep(5)
+    # 随机选择
+    user_id = random.choice(user_ids)
+    machine_id = random.choice(machine_ids)
+    product_id = random.choice(list(products.keys()))
+    quantity = random.randint(1, 3)
+    unit_price = products[product_id]
+    total = round(unit_price * quantity, 2)
 
-    client.loop_stop()
+    message = {
+        "user_id": user_id,
+        "machine_id": machine_id,
+        "product_id": product_id,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "total": total,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    topic = "vending/machine/purchase"
+    result = client.publish(topic, json.dumps(message))
+    result.wait_for_publish(timeout=2)
+
+    print(f"发送购买消息: {message}")
+    return True
+
+if __name__ == "__main__":
+    # 创建 MQTT 客户端
+    client = mqtt.Client()
+    try:
+        client.connect("localhost", 1883, 60)
+    except Exception as e:
+        print(f"MQTT 连接失败: {e}")
+        exit(1)
+
+    print("开始模拟购买行为...")
+
+    # 循环 5 次，每 5 秒发送一次
+    for i in range(5):
+        print(f"--- 第 {i+1} 次购买 ---")
+        success = publish_purchase(client)
+        if not success:
+            print(f"第 {i+1} 次发送失败")
+        time.sleep(5)  # ⏱️ 等待 5 秒
+
+    # 断开连接
     client.disconnect()
-    print("模拟器结束")
-
-except Exception as e:
-    print("MQTT 发布失败:", e)
+    print("模拟结束，已发送 5 条购买消息。")
